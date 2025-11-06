@@ -26,6 +26,7 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
           echo "$PWD/bin" >> $GITHUB_PATH
+          syft version
 
       - name: Find Dockerfiles
         id: find_dockerfiles
@@ -43,7 +44,7 @@ jobs:
           for file in ${{ steps.find_dockerfiles.outputs.dockerfiles }}; do
             image_name="scan-$(basename $file | tr '[:upper:]' '[:lower:]')"
             echo "Building image for $file..."
-            docker build -f $file -t $image_name .
+            docker build --build-arg PYTHON_VERSION=3.11 -f $file -t $image_name .
             echo "Scanning image $image_name..."
             syft $image_name -o json > ../syft-reports/$(basename $file).json
           done
