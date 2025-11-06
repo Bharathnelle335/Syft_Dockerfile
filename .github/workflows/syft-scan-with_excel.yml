@@ -133,13 +133,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 <<'PY'
-import json, csv, os, glob
-from pathlib import Path
-
-SBOMS_DIR = Path("sboms")
-COMBINED = Path("combined/syft-combined.json")
-OUT_DIR = Path("combined/csv")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+          import json, csv, os, glob
+          from pathlib import Path
+          
+          SBOMS_DIR = Path("sboms")
+          COMBINED = Path("combined/syft-combined.json")
+          OUT_DIR = Path("combined/csv")
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def flatten_dict(d, parent_key="", sep="."):
     items = []
