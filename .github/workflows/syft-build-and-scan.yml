@@ -61,7 +61,7 @@ jobs:
           git checkout "${{ inputs.ref }}" || true
           echo "Checked out $(git rev-parse --short HEAD)"
 
-      - name: Find Dockerfiles by glob
+      - name: Find Dockerfiles by glob (compact JSON output)
         id: collect
         shell: bash
         env:
@@ -70,7 +70,6 @@ jobs:
           set -euo pipefail
           cd target
           shopt -s globstar nullglob
-          # Expand the glob into concrete file paths
           FILES=()
           for pat in $GLOB; do
             for f in $pat; do
@@ -85,11 +84,17 @@ jobs:
             exit 0
           fi
 
-          printf "%s\n" "${FILES[@]}" | jq -R -s 'split("\n")|map(select(length>0))' > ../dockerfiles.json
+          # Pretty for logs
+          printf "%s\n" "${FILES[@]}" | jq -R -s 'split("\n")|map(select(length>0))' > ../dockerfiles.pretty.json
           echo "Discovered ${#FILES[@]} Dockerfile(s):"
-          cat ../dockerfiles.json
+          cat ../dockerfiles.pretty.json
 
-          echo "files_json=$(cat ../dockerfiles.json)" >> "$GITHUB_OUTPUT"
+          # Compact, single line for $GITHUB_OUTPUT
+          printf "%s\n" "${FILES[@]}" \
+            | jq -R -s 'split("\n")|map(select(length>0))' \
+            | jq -c . > ../dockerfiles.compact.json
+
+          echo "files_json=$(cat ../dockerfiles.compact.json)" >> "$GITHUB_OUTPUT"
           echo "has_files=true" >> "$GITHUB_OUTPUT"
 
   scan:
@@ -273,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p combined
-          # Keep header from the first file only
+          # Keep header from first file only
           awk 'FNR==1 && NR!=1 { next } { print }' merged/components-*.csv > combined/all-components.csv
           echo "Wrote combined/all-components.csv"
 
