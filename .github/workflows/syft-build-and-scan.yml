@@ -1,0 +1,292 @@
+name: Syft build & scan Dockerfiles (components+versions)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "Git repository URL containing Dockerfile(s)"
+        required: true
+        type: string
+      ref:
+        description: "Branch, tag, or commit to checkout in target repo"
+        required: false
+        default: "main"
+        type: string
+      dockerfile_glob:
+        description: "Glob to find Dockerfiles (e.g. **/Dockerfile*)"
+        required: false
+        default: "**/Dockerfile*"
+        type: string
+      output_format:
+        description: "SBOM output format for Syft"
+        required: false
+        default: "json"
+        type: choice
+        options:
+          - json
+          - cyclonedx-json
+          - spdx-json
+      cleanup_images:
+        description: "Remove built images after scanning (0/1)"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover Dockerfiles
+    runs-on: ubuntu-latest
+    outputs:
+      files_json: ${{ steps.collect.outputs.files_json }}
+      has_files: ${{ steps.collect.outputs.has_files }}
+    steps:
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Clone target repo
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "${{ inputs.repo_url }}" target
+          cd target
+          git fetch --depth 1 origin "${{ inputs.ref }}" || true
+          git checkout "${{ inputs.ref }}" || true
+          echo "Checked out $(git rev-parse --short HEAD)"
+
+      - name: Find Dockerfiles by glob
+        id: collect
+        shell: bash
+        env:
+          GLOB: ${{ inputs.dockerfile_glob }}
+        run: |
+          set -euo pipefail
+          cd target
+          shopt -s globstar nullglob
+          # Expand the glob into concrete file paths
+          FILES=()
+          for pat in $GLOB; do
+            for f in $pat; do
+              [[ -f "$f" ]] && FILES+=("$f")
+            done
+          done
+
+          if (( ${#FILES[@]} == 0 )); then
+            echo "No Dockerfiles found for pattern: $GLOB"
+            echo "files_json=[]" >> "$GITHUB_OUTPUT"
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf "%s\n" "${FILES[@]}" | jq -R -s 'split("\n")|map(select(length>0))' > ../dockerfiles.json
+          echo "Discovered ${#FILES[@]} Dockerfile(s):"
+          cat ../dockerfiles.json
+
+          echo "files_json=$(cat ../dockerfiles.json)" >> "$GITHUB_OUTPUT"
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Build & scan (${{ matrix.file }})
+    needs: discover
+    if: needs.discover.outputs.has_files == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file: ${{ fromJson(needs.discover.outputs.files_json) }}
+    steps:
+      - name: Install jq and Syft
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft version
+
+      - name: Clone target repo
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "${{ inputs.repo_url }}" target
+          cd target
+          git fetch --depth 1 origin "${{ inputs.ref }}" || true
+          git checkout "${{ inputs.ref }}" || true
+
+      - name: Build image from Dockerfile
+        id: build
+        shell: bash
+        env:
+          FILE: ${{ matrix.file }}
+        run: |
+          set -euo pipefail
+          cd target
+
+          DF="$FILE"
+          CTX_DIR="$(dirname "$DF")"
+          SAFE_NAME=$(echo "$DF" | tr '/\\ ' '___' | tr -cd '[:alnum:]_.-')
+          TAG="syftscan:${SAFE_NAME,,}"
+
+          echo "dockerfile=$DF" >> "$GITHUB_OUTPUT"
+          echo "ctx_dir=$CTX_DIR" >> "$GITHUB_OUTPUT"
+          echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Building image: $TAG"
+          docker build -f "$DF" -t "$TAG" "$CTX_DIR"
+
+      - name: Syft scan image → SBOM JSON
+        id: syftscan
+        shell: bash
+        env:
+          TAG: ${{ steps.build.outputs.tag }}
+          SAFE: ${{ steps.build.outputs.safe_name }}
+          OUT_FMT: ${{ inputs.output_format }}
+        run: |
+          set -euo pipefail
+          mkdir -p sboms components
+          SBOM="sboms/syft-${SAFE}.${OUT_FMT/+-/_}.json"
+          echo "sbom_path=$SBOM" >> "$GITHUB_OUTPUT"
+          syft "$TAG" -o "$OUT_FMT" > "$SBOM"
+          echo "Wrote $SBOM"
+
+      - name: Extract components (+versions) to CSV
+        shell: bash
+        env:
+          TAG: ${{ steps.build.outputs.tag }}
+          DF:  ${{ steps.build.outputs.dockerfile }}
+          SAFE: ${{ steps.build.outputs.safe_name }}
+          OUT_FMT: ${{ inputs.output_format }}
+        run: |
+          set -euo pipefail
+          CSV="components/components-${SAFE}.csv"
+          echo "image,dockerfile,name,version,type,purl,licenses,locations" > "$CSV"
+
+          case "$OUT_FMT" in
+            json)
+              jq -r --arg img "$TAG" --arg df "$DF" '
+                .
+                | (.artifacts // [])
+                | map({
+                    image: $img,
+                    dockerfile: $df,
+                    name: (.name // ""),
+                    version: (.version // ""),
+                    type: (.type // ""),
+                    purl: (.purl // ""),
+                    licenses: ((.licenses // []) | map(if type=="object" then (.value // "") else tostring end) | join("; ")),
+                    locations: ((.locations // []) | map(.path // "") | join("; "))
+                  })
+                | ( .[] | [
+                    .image, .dockerfile, .name, .version, .type, .purl, .licenses, .locations
+                  ] | @csv )
+              ' "sboms/syft-${SAFE}.${OUT_FMT/+-/_}.json" >> "$CSV"
+              ;;
+            cyclonedx-json)
+              jq -r --arg img "$TAG" --arg df "$DF" '
+                .
+                | (.components // [])
+                | map({
+                    image: $img,
+                    dockerfile: $df,
+                    name: (.name // ""),
+                    version: (.version // ""),
+                    type: (.type // ""),
+                    purl: (.purl // ""),
+                    licenses: ((.licenses // []) | map(
+                      if .license then
+                        (.license.id // .license.name // "")
+                      else "" end
+                    ) | join("; ")),
+                    locations: ""
+                  })
+                | ( .[] | [
+                    .image, .dockerfile, .name, .version, .type, .purl, .licenses, .locations
+                  ] | @csv )
+              ' "sboms/syft-${SAFE}.${OUT_FMT/+-/_}.json" >> "$CSV"
+              ;;
+            spdx-json)
+              jq -r --arg img "$TAG" --arg df "$DF" '
+                .
+                | (.packages // [])
+                | map({
+                    image: $img,
+                    dockerfile: $df,
+                    name: (.name // ""),
+                    version: (.versionInfo // ""),
+                    type: (.primaryPackagePurpose // ""),
+                    purl: ( (.externalRefs // []) | map(select(.referenceType=="purl") | .referenceLocator) | first // "" ),
+                    licenses: (.licenseConcluded // ""),
+                    locations: ""
+                  })
+                | ( .[] | [
+                    .image, .dockerfile, .name, .version, .type, .purl, .licenses, .locations
+                  ] | @csv )
+              ' "sboms/syft-${SAFE}.${OUT_FMT/+-/_}.json" >> "$CSV"
+              ;;
+            *)
+              echo "Unsupported output_format: $OUT_FMT" >&2
+              exit 2
+              ;;
+          esac
+
+          echo "Wrote $CSV"
+
+      - name: Optionally remove image
+        if: ${{ inputs.cleanup_images == '1' }}
+        shell: bash
+        env:
+          TAG: ${{ steps.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker rmi "$TAG" || true
+
+      - name: Upload artifacts (SBOM + components CSV)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-and-components-${{ steps.build.outputs.safe_name }}
+          path: |
+            sboms/*.json
+            components/*.csv
+          if-no-files-found: error
+
+  combine:
+    name: Combine CSVs
+    needs: [discover, scan]
+    if: needs.discover.outputs.has_files == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all components CSV artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sbom-and-components-*
+          merge-multiple: true
+          path: merged
+
+      - name: Merge all per-image CSVs into one
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p combined
+          # Keep header from the first file only
+          awk 'FNR==1 && NR!=1 { next } { print }' merged/components-*.csv > combined/all-components.csv
+          echo "Wrote combined/all-components.csv"
+
+      - name: Upload combined CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-components
+          path: combined/all-components.csv
+
+  no_files_hint:
+    name: No Dockerfiles found
+    needs: discover
+    if: needs.discover.outputs.has_files != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No Dockerfiles matched the pattern. Adjust 'dockerfile_glob' and re-run."
