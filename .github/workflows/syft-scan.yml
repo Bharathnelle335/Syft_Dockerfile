@@ -1,4 +1,4 @@
-name: Syft scan Dockerfiles (static)
+name: Syft scan Dockerfiles (static, one CSV with all data)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,10 @@ on:
         required: false
         default: "json"
         type: choice
-        options: [json, spdx-json, cyclonedx-json]
+        options:
+          - json
+          - spdx-json
+          - cyclonedx-json
 
 permissions:
   contents: read
@@ -81,6 +84,7 @@ jobs:
 
       - name: Install Syft
         run: |
+          set -euo pipefail
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
           syft version
 
@@ -107,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   combine:
-    name: Combine SBOMs
+    name: Combine & one CSV (jq only)
     needs: [discover, scan]
     if: needs.discover.outputs.has_files == 'true'
     runs-on: ubuntu-latest
@@ -120,7 +124,10 @@ jobs:
           path: sboms
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Combine JSON SBOMs
         run: |
@@ -129,11 +136,41 @@ jobs:
           jq -s '.' sboms/*.json > combined/syft-combined.json
           echo "Wrote combined/syft-combined.json"
 
-      - name: Upload combined SBOM
+      - name: Prepare jq program (no heredocs)
+        run: |
+          set -euo pipefail
+          mkdir -p combined/jq combined/out
+          # flatten scalars at any depth into dot.path keys
+          echo 'def flatten: reduce paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) });' > combined/jq/flatten.jq
+          # make one CSV that contains EVERYTHING (fully dynamic)
+          {
+            echo 'include "flatten";'
+            echo 'def docs: if type=="array" then .[] else . end;'
+            echo '[ inputs'
+            echo '  | (docs) as $doc'
+            echo '  | ( $doc | flatten ) as $row'
+            echo '  | $row + { source: ($doc.__src // "unknown") }'
+            echo '] as $rows'
+            echo '| ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H'
+            echo '| ($H | @csv),'
+            echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
+          } > combined/jq/all_data.jq
+
+      - name: Export one CSV with all data (Excel-compatible)
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -r -L combined/jq -f combined/jq/all_data.jq \
+            <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+            <(jq --arg __src "combined/syft-combined.json" '(. + { "__src":$__src })' combined/syft-combined.json) \
+            > combined/out/all-data.csv
+          echo "Wrote combined/out/all-data.csv"
+
+      - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-combined
-          path: combined/syft-combined.json
+          name: sbom-all-data-csv
+          path: combined/out/all-data.csv
 
   no_files_hint:
     name: No Dockerfiles found
