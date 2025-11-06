@@ -1,4 +1,4 @@
-name: Syft scan Dockerfiles (static, pure-jq CSV)
+name: Syft scan Dockerfiles (static, dynamic CSV export)
 
 on:
   workflow_dispatch:
@@ -111,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   combine:
-    name: Combine & Export CSV (jq only)
+    name: Combine & Export CSV (jq only, dynamic)
     needs: [discover, scan]
     if: needs.discover.outputs.has_files == 'true'
     runs-on: ubuntu-latest
@@ -143,7 +143,7 @@ jobs:
           # flatten.jq
           echo 'def flatten: reduce paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) });' > combined/jq/flatten.jq
 
-          # packages.jq
+          # packages.jq (SBOM-aware)
           {
             echo 'include "flatten";'
             echo 'def docs: if type=="array" then .[] else . end;'
@@ -158,7 +158,7 @@ jobs:
             echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
           } > combined/jq/packages.jq
 
-          # relationships.jq
+          # relationships.jq (SBOM-aware)
           {
             echo 'include "flatten";'
             echo 'def docs: if type=="array" then .[] else . end;'
@@ -173,7 +173,7 @@ jobs:
             echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
           } > combined/jq/relationships.jq
 
-          # summary.jq
+          # summary.jq (SBOM-aware)
           {
             echo 'include "flatten";'
             echo 'def docs: if type=="array" then .[] else . end;'
@@ -192,6 +192,20 @@ jobs:
             echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
           } > combined/jq/summary.jq
 
+          # all_flat.jq (GENERIC: works for ANY JSON shape)
+          {
+            echo 'include "flatten";'
+            echo '[ inputs'
+            echo '  | if type=="array"'
+            echo '    then to_entries[] | {__src:(.__src // null), idx:.key, row:(.value | flatten)}'
+            echo '    else {__src:(.__src // null), idx:null, row:(. | flatten)}'
+            echo '    end'
+            echo '  | .row + {source:(.__src // "unknown"), doc_index:(.idx // 0)}'
+            echo '] as $rows'
+            echo '| ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H'
+            echo '| ($H | @csv),'
+            echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
+          } > combined/jq/all_flat.jq
 
       - name: Export packages.csv
         shell: bash
@@ -199,7 +213,7 @@ jobs:
           set -euo pipefail
           jq -r -L combined/jq -f combined/jq/packages.jq \
             <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
-            combined/syft-combined.json \
+            <(jq --arg __src "combined/syft-combined.json" '(. + { "__src":$__src })' combined/syft-combined.json) \
             > combined/csv/packages.csv
 
       - name: Export relationships.csv
@@ -208,7 +222,7 @@ jobs:
           set -euo pipefail
           jq -r -L combined/jq -f combined/jq/relationships.jq \
             <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
-            combined/syft-combined.json \
+            <(jq --arg __src "combined/syft-combined.json" '(. + { "__src":$__src })' combined/syft-combined.json) \
             > combined/csv/relationships.csv
 
       - name: Export summary.csv
@@ -217,8 +231,17 @@ jobs:
           set -euo pipefail
           jq -r -L combined/jq -f combined/jq/summary.jq \
             <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
-            combined/syft-combined.json \
+            <(jq --arg __src "combined/syft-combined.json" '(. + { "__src":$__src })' combined/syft-combined.json) \
             > combined/csv/summary.csv
+
+      - name: Export all-flat.csv (generic, always populated)
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -r -L combined/jq -f combined/jq/all_flat.jq \
+            <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+            <(jq --arg __src "combined/syft-combined.json" '(. + { "__src":$__src })' combined/syft-combined.json) \
+            > combined/csv/all-flat.csv
 
       - name: Upload combined JSON
         uses: actions/upload-artifact@v4
