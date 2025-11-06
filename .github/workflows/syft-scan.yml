@@ -45,25 +45,26 @@ jobs:
           echo "Checked out $(git rev-parse --short HEAD)"
 
       - name: Find Dockerfiles
-        id: collect
-        run: |
-          set -euo pipefail
-          cd target
-          # Use Python to do a robust glob and JSON emit
-          python3 - <<'PY'
-          import json, glob, sys, os
-          pattern = os.environ.get("GLOB", "**/Dockerfile*")
-          files = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
-          if not files:
-              print("files_json=[]")
-              print("has_files=false")
-          else:
-              print("files_json=" + json.dumps(files))
-              print("has_files=true")
-          PY
-                  env:
-                    GLOB: ${{ inputs.dockerfile_glob }}
-                  shell: bash | tee "$GITHUB_OUTPUT"
+  id: collect
+  shell: bash
+  env:
+    GLOB: ${{ inputs.dockerfile_glob }}   # e.g. **/Dockerfile*
+  run: |
+    set -euo pipefail
+    cd target
+    # Compute files and emit workflow outputs
+    python3 - <<'PY' | tee -a "$GITHUB_OUTPUT"
+    import json, glob, os
+    pattern = os.environ.get("GLOB", "**/Dockerfile*")
+    files = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
+if not files:
+    print("files_json=[]")
+    print("has_files=false")
+else:
+    print("files_json=" + json.dumps(files))
+    print("has_files=true")
+PY
+
 
   scan:
     name: Syft scan (${{ matrix.file }})
