@@ -140,12 +140,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p combined/jq combined/csv
+          # flatten.jq
           echo 'def flatten: reduce paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) });' > combined/jq/flatten.jq
+
           # packages.jq
           {
             echo 'include "flatten";'
+            echo 'def docs: if type=="array" then .[] else . end;'
             echo '[ inputs'
-            echo '  | ( (type=="array")? .[] : . ) as $doc'
+            echo '  | (docs) as $doc'
             echo '  | ($doc.artifacts // [])[]'
             echo '  | flatten'
             echo '  | .source = ( $doc.__src // "unknown" )'
@@ -154,11 +157,13 @@ jobs:
             echo '| ($H | @csv),'
             echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
           } > combined/jq/packages.jq
+
           # relationships.jq
           {
             echo 'include "flatten";'
+            echo 'def docs: if type=="array" then .[] else . end;'
             echo '[ inputs'
-            echo '  | ( (type=="array")? .[] : . ) as $doc'
+            echo '  | (docs) as $doc'
             echo '  | ($doc.artifactRelationships // [])'
             echo '  | map( flatten + {source: ($doc.__src // "unknown")} )'
             echo '  | .[]'
@@ -167,11 +172,13 @@ jobs:
             echo '| ($H | @csv),'
             echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
           } > combined/jq/relationships.jq
+
           # summary.jq
           {
             echo 'include "flatten";'
+            echo 'def docs: if type=="array" then .[] else . end;'
             echo '[ inputs'
-            echo '  | ( (type=="array")? .[] : . ) as $doc'
+            echo '  | (docs) as $doc'
             echo '  | {'
             echo '      source: ($doc.__src // "unknown"),'
             echo '      descriptor: $doc.descriptor,'
@@ -184,6 +191,7 @@ jobs:
             echo '| ($H | @csv),'
             echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
           } > combined/jq/summary.jq
+
 
       - name: Export packages.csv
         shell: bash
