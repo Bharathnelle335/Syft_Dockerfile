@@ -273,14 +273,19 @@ jobs:
           merge-multiple: true
           path: merged
 
-      - name: Merge all per-image CSVs into one
+      - name: Merge all per-image CSVs into one (robust)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p combined
-          # Keep header from first file only
-          awk 'FNR==1 && NR!=1 { next } { print }' merged/components-*.csv > combined/all-components.csv
-          echo "Wrote combined/all-components.csv"
+          if compgen -G "merged/*.csv" > /dev/null; then
+            echo "Merging $(ls merged/*.csv | wc -l) CSV files..."
+            awk 'FNR==1 && NR!=1 { next } { print }' merged/*.csv > combined/all-components.csv
+            echo "Wrote combined/all-components.csv"
+          else
+            echo "⚠️  No CSV files found in merged/. Check previous steps or empty Syft output."
+            echo "image,dockerfile,name,version,type,purl,licenses,locations" > combined/all-components.csv
+          fi
 
       - name: Upload combined CSV
         uses: actions/upload-artifact@v4
