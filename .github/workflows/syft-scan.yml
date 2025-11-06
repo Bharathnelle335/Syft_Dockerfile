@@ -52,14 +52,17 @@ jobs:
         run: |
           set -euo pipefail
           cd target
-          FILES_JSON=$(python3 -c 'import json,glob,os; p=os.getenv("GLOB","**/Dockerfile*"); f=[x for x in glob.glob(p,recursive=True) if os.path.isfile(x)]; print("[]") if not f else print(json.dumps(f))')
-          if [ "$FILES_JSON" = "[]" ]; then
-            echo "files_json=[]" >> "$GITHUB_OUTPUT"
-            echo "has_files=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "files_json=$FILES_JSON" >> "$GITHUB_OUTPUT"
-            echo "has_files=true" >> "$GITHUB_OUTPUT"
-          fi
+          python3 <<'EOF' | tee -a "$GITHUB_OUTPUT"
+import json, glob, os
+pattern = os.getenv("GLOB", "**/Dockerfile*")
+files = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
+if not files:
+    print("files_json=[]")
+    print("has_files=false")
+else:
+    print("files_json=" + json.dumps(files))
+    print("has_files=true")
+EOF
 
   scan:
     name: Syft scan (${{ matrix.file }})
@@ -85,6 +88,7 @@ jobs:
           syft version
 
       - name: Scan Dockerfile (static)
+        id: scan_step
         working-directory: target
         env:
           OUT_FMT: ${{ inputs.output_format }}
@@ -96,11 +100,12 @@ jobs:
           OUT="../sboms/syft-$SAFE_NAME.${OUT_FMT/+-/_}.json"
           echo "Scanning $FILE -> $OUT"
           syft "$FILE" -o "$OUT_FMT" > "$OUT"
+          echo "safe_name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Upload SBOMs (per Dockerfile)
+      - name: Upload SBOM (per Dockerfile)
         uses: actions/upload-artifact@v4
         with:
-          name: sboms-per-dockerfile
+          name: sbom-${{ steps.scan_step.outputs.safe_name }}
           path: sboms/*.json
           if-no-files-found: error
 
@@ -110,10 +115,11 @@ jobs:
     if: needs.discover.outputs.has_files == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download SBOMs
+      - name: Download all SBOM artifacts
         uses: actions/download-artifact@v4
         with:
-          name: sboms-per-dockerfile
+          pattern: sbom-*
+          merge-multiple: true
           path: sboms
 
       - name: Install jq
