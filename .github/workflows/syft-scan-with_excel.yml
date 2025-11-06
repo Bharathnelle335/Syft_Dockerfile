@@ -84,6 +84,7 @@ jobs:
 
       - name: Install Syft
         run: |
+          set -euo pipefail
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
           syft version
 
@@ -110,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   combine:
-    name: Combine & Export CSV (pure jq)
+    name: Combine & Export CSV (jq only)
     needs: [discover, scan]
     if: needs.discover.outputs.has_files == 'true'
     runs-on: ubuntu-latest
@@ -124,6 +125,7 @@ jobs:
 
       - name: Install jq
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq
 
@@ -134,75 +136,87 @@ jobs:
           jq -s '.' sboms/*.json > combined/syft-combined.json
           echo "Wrote combined/syft-combined.json"
 
-      - name: Export packages.csv (flattened)
+      - name: Prepare jq programs (no heredocs)
         run: |
           set -euo pipefail
-          mkdir -p combined/csv
-          # Build a single rows array from ALL per-file JSONs and the combined file (dedup if same docs)
-          jq -r '
-            def flatten:
-              reduce (paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) }));
-            # Gather rows from individual files:
-            [ inputs
-              | ( (type=="array")? .[] : . ) as $doc
-              | ($doc.artifacts // [])[]
-              | flatten
-              | .source = ( $doc.__src // "unknown" )
-            ] as $rows
-            # CSV header = union of keys
-            | ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H
-            | ($H | @csv),
-              ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )
-          ' \
-          <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
-          combined/syft-combined.json \
-          > combined/csv/packages.csv
+          mkdir -p combined/jq combined/csv
+          echo 'def flatten: reduce paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) });' > combined/jq/flatten.jq
+          # packages.jq
+          {
+            echo 'include "flatten";'
+            echo '[ inputs'
+            echo '  | ( (type=="array")? .[] : . ) as $doc'
+            echo '  | ($doc.artifacts // [])[]'
+            echo '  | flatten'
+            echo '  | .source = ( $doc.__src // "unknown" )'
+            echo '] as $rows'
+            echo '| ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H'
+            echo '| ($H | @csv),'
+            echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
+          } > combined/jq/packages.jq
+          # relationships.jq
+          {
+            echo 'include "flatten";'
+            echo '[ inputs'
+            echo '  | ( (type=="array")? .[] : . ) as $doc'
+            echo '  | ($doc.artifactRelationships // [])'
+            echo '  | map( flatten + {source: ($doc.__src // "unknown")} )'
+            echo '  | .[]'
+            echo '] as $rows'
+            echo '| ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H'
+            echo '| ($H | @csv),'
+            echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
+          } > combined/jq/relationships.jq
+          # summary.jq
+          {
+            echo 'include "flatten";'
+            echo '[ inputs'
+            echo '  | ( (type=="array")? .[] : . ) as $doc'
+            echo '  | {'
+            echo '      source: ($doc.__src // "unknown"),'
+            echo '      descriptor: $doc.descriptor,'
+            echo '      distro: $doc.distro,'
+            echo '      source_meta: $doc.source'
+            echo '    }'
+            echo '  | flatten'
+            echo '] as $rows'
+            echo '| ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H'
+            echo '| ($H | @csv),'
+            echo '  ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )'
+          } > combined/jq/summary.jq
 
-      - name: Export relationships.csv (flattened)
+      - name: Export packages.csv
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p combined/csv
-          jq -r '
-            def flatten:
-              reduce (paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) }));
-            [ inputs
-              | ( (type=="array")? .[] : . ) as $doc
-              | ($doc.artifactRelationships // [])
-              | map( flatten + {source: ($doc.__src // "unknown")} )
-              | .[]
-            ] as $rows
-            | ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H
-            | ($H | @csv),
-              ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )
-          ' \
-          <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
-          combined/syft-combined.json \
-          > combined/csv/relationships.csv
+          jq -r -L combined/jq -f combined/jq/packages.jq \
+            <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+            combined/syft-combined.json \
+            > combined/csv/packages.csv
 
-      - name: Export summary.csv (descriptor/distro/source)
+      - name: Export relationships.csv
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p combined/csv
-          jq -r '
-            def flatten:
-              reduce (paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) }));
-            [ inputs
-              | ( (type=="array")? .[] : . ) as $doc
-              | {
-                  source: ($doc.__src // "unknown"),
-                  descriptor: $doc.descriptor,
-                  distro: $doc.distro,
-                  source_meta: $doc.source
-                }
-              | flatten
-            ] as $rows
-            | ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H
-            | ($H | @csv),
-              ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )
-          ' \
-          <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
-          combined/syft-combined.json \
-          > combined/csv/summary.csv
+          jq -r -L combined/jq -f combined/jq/relationships.jq \
+            <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+            combined/syft-combined.json \
+            > combined/csv/relationships.csv
+
+      - name: Export summary.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -r -L combined/jq -f combined/jq/summary.jq \
+            <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+            combined/syft-combined.json \
+            > combined/csv/summary.csv
+
+      - name: Upload combined JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-combined
+          path: combined/syft-combined.json
 
       - name: Upload CSVs
         uses: actions/upload-artifact@v4
