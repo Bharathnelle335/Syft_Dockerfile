@@ -26,7 +26,9 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
           echo "$PWD/bin" >> $GITHUB_PATH
-          syft version
+
+      - name: Verify Syft Installation
+        run: syft version
 
       - name: Find Dockerfiles
         id: find_dockerfiles
