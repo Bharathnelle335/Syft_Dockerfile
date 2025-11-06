@@ -45,24 +45,21 @@ jobs:
           echo "Checked out $(git rev-parse --short HEAD)"
 
       - name: Find Dockerfiles
-        id: collect
-        shell: bash
-        env:
-          GLOB: ${{ inputs.dockerfile_glob }}
-        run: |
-          set -euo pipefail
-          cd target
-          python3 <<'EOF' | tee -a "$GITHUB_OUTPUT"
-import json, glob, os
-pattern = os.getenv("GLOB", "**/Dockerfile*")
-files = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
-if not files:
-    print("files_json=[]")
-    print("has_files=false")
-else:
-    print("files_json=" + json.dumps(files))
-    print("has_files=true")
-EOF
+          id: collect
+          shell: bash
+          env:
+            GLOB: ${{ inputs.dockerfile_glob }}
+          run: |
+            set -euo pipefail
+            cd target
+            FILES_JSON=$(python3 -c 'import json,glob,os; p=os.getenv("GLOB","**/Dockerfile*"); f=[x for x in glob.glob(p,recursive=True) if os.path.isfile(x)]; print("[]") if not f else print(json.dumps(f))')
+            if [ "$FILES_JSON" = "[]" ]; then
+              echo "files_json=[]" >> "$GITHUB_OUTPUT"
+              echo "has_files=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "files_json=$FILES_JSON" >> "$GITHUB_OUTPUT"
+              echo "has_files=true" >> "$GITHUB_OUTPUT"
+            fi
 
   scan:
     name: Syft scan (${{ matrix.file }})
