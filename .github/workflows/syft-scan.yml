@@ -1,58 +1,151 @@
-name: Syft Dockerfile Scan
+name: Syft scan Dockerfiles (static)
 
 on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: "GitHub repository URL containing Dockerfiles"
+        description: "Git repository URL containing Dockerfile(s)"
         required: true
         type: string
+      ref:
+        description: "Branch, tag, or commit to checkout"
+        required: false
+        default: "main"
+        type: string
+      dockerfile_glob:
+        description: "Glob to find Dockerfiles"
+        required: false
+        default: "**/Dockerfile*"
+        type: string
+      output_format:
+        description: "SBOM output format"
+        required: false
+        default: "json"
+        type: choice
+        options: [json, spdx-json, cyclonedx-json]
+
+permissions:
+  contents: read
 
 jobs:
-  syft-scan:
+  discover:
     runs-on: ubuntu-latest
-
+    outputs:
+      files_json: ${{ steps.collect.outputs.files_json }}
+      has_files: ${{ steps.collect.outputs.has_files }}
     steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-
-      - name: Clone target repository
+      - name: Clone target repo
         run: |
-          git clone ${{ github.event.inputs.repo_url }} target-repo
-          cd target-repo
-          echo "Repository cloned successfully."
+          set -euo pipefail
+          git clone --depth 1 "${{ inputs.repo_url }}" target
+          cd target
+          git fetch --depth 1 origin "${{ inputs.ref }}" || true
+          git checkout "${{ inputs.ref }}" || true
+          echo "Checked out $(git rev-parse --short HEAD)"
+
+      - name: Find Dockerfiles
+        id: collect
+        run: |
+          set -euo pipefail
+          cd target
+          shopt -s globstar nullglob
+          mapfile -t FILES < <(printf "%s\n" ${{ inputs.dockerfile_glob }})
+          FILTERED=()
+          for f in "${FILES[@]:-}"; do [[ -f "$f" ]] && FILTERED+=("$f"); done
+
+          if (( ${#FILTERED[@]} == 0 )); then
+            echo "files_json=[]" >> "$GITHUB_OUTPUT"
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - << 'PY' > files.json
+import json,sys,os
+files = [line.strip() for line in sys.stdin if line.strip()]
+print(json.dumps(files))
+PY
+          printf "%s\n" "${FILTERED[@]}" | python3 -u files.json > /dev/null 2>&1 || true
+
+          FILES_JSON=$(python3 - << 'PY'
+import json,sys
+print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))
+PY
+          <<< "$(printf "%s\n" "${FILTERED[@]}")")
+
+          echo "files_json=$FILES_JSON" >> "$GITHUB_OUTPUT"
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: discover
+    if: needs.discover.outputs.has_files == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file: ${{ fromJson(needs.discover.outputs.files_json) }}
+    steps:
+      - name: Clone target repo
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "${{ inputs.repo_url }}" target
+          cd target
+          git fetch --depth 1 origin "${{ inputs.ref }}" || true
+          git checkout "${{ inputs.ref }}" || true
 
       - name: Install Syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
-          echo "$PWD/bin" >> $GITHUB_PATH
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft version
 
-      - name: Verify Syft Installation
-        run: syft version
-
-      - name: Find Dockerfiles
-        id: find_dockerfiles
+      - name: Scan Dockerfile (static)
+        working-directory: target
+        env:
+          OUT_FMT: ${{ inputs.output_format }}
+          FILE: ${{ matrix.file }}
         run: |
-          cd target-repo
-          dockerfiles=$(find . -type f -iname "Dockerfile*")
-          echo "Found Dockerfiles:"
-          echo "$dockerfiles"
-          echo "dockerfiles=$dockerfiles" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          mkdir -p ../sboms
+          SAFE_NAME=$(echo "$FILE" | tr '/\\ ' '___' | tr -cd '[:alnum:]_.-')
+          OUT="../sboms/syft-$SAFE_NAME.${OUT_FMT/+-/_}.json"
+          echo "Scanning $FILE -> $OUT"
+          syft "$FILE" -o "$OUT_FMT" > "$OUT"
 
-      - name: Scan Dockerfiles with Syft
-        run: |
-          mkdir -p syft-reports
-          cd target-repo
-          for file in ${{ steps.find_dockerfiles.outputs.dockerfiles }}; do
-            image_name="scan-$(basename $file | tr '[:upper:]' '[:lower:]')"
-            echo "Building image for $file with Python 3.11..."
-            docker build --build-arg PYTHON_VERSION=3.11 -f $file -t $image_name .
-            echo "Scanning image $image_name..."
-            syft $image_name -o json > ../syft-reports/$(basename $file).json
-          done
-
-      - name: Upload SBOM Reports
+      - name: Upload SBOMs
         uses: actions/upload-artifact@v4
         with:
-          name: syft-sbom-reports
-          path: syft-reports/
+          name: sboms-per-dockerfile
+          path: sboms/*.json
+
+  combine:
+    needs: [discover, scan]
+    if: needs.discover.outputs.has_files == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sboms-per-dockerfile
+          path: sboms
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Combine SBOMs
+        run: |
+          set -euo pipefail
+          mkdir -p combined
+          jq -s '.' sboms/*.json > combined/syft-combined.json
+          echo "Wrote combined/syft-combined.json"
+
+      - name: Upload combined
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-combined
+          path: combined/syft-combined.json
+
+  no_files:
+    needs: discover
+    if: needs.discover.outputs.has_files != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No Dockerfiles matched the pattern. Adjust 'dockerfile_glob' input and re-run."
