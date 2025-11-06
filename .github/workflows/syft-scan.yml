@@ -45,7 +45,7 @@ jobs:
           cd target-repo
           for file in ${{ steps.find_dockerfiles.outputs.dockerfiles }}; do
             image_name="scan-$(basename $file | tr '[:upper:]' '[:lower:]')"
-            echo "Building image for $file..."
+            echo "Building image for $file with Python 3.11..."
             docker build --build-arg PYTHON_VERSION=3.11 -f $file -t $image_name .
             echo "Scanning image $image_name..."
             syft $image_name -o json > ../syft-reports/$(basename $file).json
