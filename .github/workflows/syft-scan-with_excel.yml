@@ -1,4 +1,4 @@
-name: Syft scan Dockerfiles (static, no pandas)
+name: Syft scan Dockerfiles (static, pure-jq CSV)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,10 @@ on:
         required: false
         default: "json"
         type: choice
-        options: [json, spdx-json, cyclonedx-json]
+        options:
+          - json
+          - spdx-json
+          - cyclonedx-json
 
 permissions:
   contents: read
@@ -107,7 +110,7 @@ jobs:
           if-no-files-found: error
 
   combine:
-    name: Combine & Export CSV
+    name: Combine & Export CSV (pure jq)
     needs: [discover, scan]
     if: needs.discover.outputs.has_files == 'true'
     runs-on: ubuntu-latest
@@ -120,7 +123,9 @@ jobs:
           path: sboms
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Combine JSON SBOMs
         run: |
@@ -129,86 +134,77 @@ jobs:
           jq -s '.' sboms/*.json > combined/syft-combined.json
           echo "Wrote combined/syft-combined.json"
 
-      - name: Convert SBOM JSONs to CSV (Excel-compatible)
+      - name: Export packages.csv (flattened)
         run: |
           set -euo pipefail
-          python3 <<'PY'
-          import json, csv, os, glob
-          from pathlib import Path
-          
-          SBOMS_DIR = Path("sboms")
-          COMBINED = Path("combined/syft-combined.json")
-          OUT_DIR = Path("combined/csv")
-          OUT_DIR.mkdir(parents=True, exist_ok=True)
+          mkdir -p combined/csv
+          # Build a single rows array from ALL per-file JSONs and the combined file (dedup if same docs)
+          jq -r '
+            def flatten:
+              reduce (paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) }));
+            # Gather rows from individual files:
+            [ inputs
+              | ( (type=="array")? .[] : . ) as $doc
+              | ($doc.artifacts // [])[]
+              | flatten
+              | .source = ( $doc.__src // "unknown" )
+            ] as $rows
+            # CSV header = union of keys
+            | ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H
+            | ($H | @csv),
+              ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )
+          ' \
+          <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+          combined/syft-combined.json \
+          > combined/csv/packages.csv
 
-def flatten_dict(d, parent_key="", sep="."):
-    items = []
-    for k, v in (d or {}).items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key, sep=sep).items())
-        elif isinstance(v, list):
-            items.append((new_key, "; ".join(map(str, v))))
-        else:
-            items.append((new_key, v))
-    return dict(items)
+      - name: Export relationships.csv (flattened)
+        run: |
+          set -euo pipefail
+          mkdir -p combined/csv
+          jq -r '
+            def flatten:
+              reduce (paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) }));
+            [ inputs
+              | ( (type=="array")? .[] : . ) as $doc
+              | ($doc.artifactRelationships // [])
+              | map( flatten + {source: ($doc.__src // "unknown")} )
+              | .[]
+            ] as $rows
+            | ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H
+            | ($H | @csv),
+              ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )
+          ' \
+          <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+          combined/syft-combined.json \
+          > combined/csv/relationships.csv
 
-def write_csv(rows, file_path):
-    if not rows:
-        with open(file_path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["note"])
-            csv.writer(f).writerow(["no data"])
-        return
-    keys = sorted({k for r in rows for k in r.keys()})
-    with open(file_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
+      - name: Export summary.csv (descriptor/distro/source)
+        run: |
+          set -euo pipefail
+          mkdir -p combined/csv
+          jq -r '
+            def flatten:
+              reduce (paths(scalars) as $p ({}; . + { ($p|map(tostring)|join(".")) : getpath($p) }));
+            [ inputs
+              | ( (type=="array")? .[] : . ) as $doc
+              | {
+                  source: ($doc.__src // "unknown"),
+                  descriptor: $doc.descriptor,
+                  distro: $doc.distro,
+                  source_meta: $doc.source
+                }
+              | flatten
+            ] as $rows
+            | ( ($rows | reduce .[] as $r ({}; . + $r) | keys) ) as $H
+            | ($H | @csv),
+              ( $rows[] | [ $H[] as $k | ( .[$k] // "" ) ] | @csv )
+          ' \
+          <(for f in sboms/*.json; do jq --arg __src "$f" '(. + { "__src":$__src })' "$f"; done) \
+          combined/syft-combined.json \
+          > combined/csv/summary.csv
 
-def parse_syft_json(data, label):
-    if not isinstance(data, dict):
-        return [], [], []
-    packages, rels, summaries = [], [], []
-    for art in data.get("artifacts", []):
-        base = {"source": label}
-        base.update(flatten_dict(art))
-        packages.append(base)
-    for rel in data.get("artifactRelationships", []):
-        rels.append({"source": label, **flatten_dict(rel)})
-    summaries.append({"source": label, **flatten_dict({
-        "descriptor": data.get("descriptor"),
-        "distro": data.get("distro"),
-        "source_meta": data.get("source")
-    })})
-    return packages, rels, summaries
-
-# Gather JSON files
-json_files = sorted(SBOMS_DIR.glob("*.json"))
-if COMBINED.exists():
-    json_files.append(COMBINED)
-
-all_packages, all_rels, all_summaries = [], [], []
-
-for f in json_files:
-    label = f.as_posix()
-    with open(f, "r", encoding="utf-8") as fh:
-        content = json.load(fh)
-    objs = content if isinstance(content, list) else [content]
-    for i, obj in enumerate(objs):
-        src_label = f"{label}#{i}" if len(objs) > 1 else label
-        p, r, s = parse_syft_json(obj, src_label)
-        all_packages.extend(p)
-        all_rels.extend(r)
-        all_summaries.extend(s)
-
-write_csv(all_packages, OUT_DIR / "packages.csv")
-write_csv(all_rels, OUT_DIR / "relationships.csv")
-write_csv(all_summaries, OUT_DIR / "summary.csv")
-print(f"Wrote CSVs to {OUT_DIR}")
-PY
-
-      - name: Upload combined outputs
+      - name: Upload CSVs
         uses: actions/upload-artifact@v4
         with:
           name: sbom-csv
