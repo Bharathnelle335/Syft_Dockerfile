@@ -1,0 +1,52 @@
+name: Syft Dockerfile Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "GitHub repository URL containing Dockerfiles"
+        required: true
+        type: string
+
+jobs:
+  syft-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v3
+
+      - name: Clone target repository
+        run: |
+          git clone ${{ github.event.inputs.repo_url }} target-repo
+          cd target-repo
+          echo "Repository cloned successfully."
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
+          syft version
+
+      - name: Find Dockerfiles
+        id: find_dockerfiles
+        run: |
+          cd target-repo
+          dockerfiles=$(find . -type f -iname "Dockerfile*")
+          echo "Found Dockerfiles:"
+          echo "$dockerfiles"
+          echo "dockerfiles=$dockerfiles" >> $GITHUB_OUTPUT
+
+      - name: Scan Dockerfiles with Syft
+        run: |
+          mkdir -p syft-reports
+          cd target-repo
+          for file in ${{ steps.find_dockerfiles.outputs.dockerfiles }}; do
+            echo "Scanning $file..."
+            syft dockerfile:$file -o json > ../syft-reports/$(basename $file).json
+          done
+
+      - name: Upload SBOM Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: syft-sbom-reports
+          path: syft-reports/
